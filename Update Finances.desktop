@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Update Finances
+Comment=Combine bank statements into Finances.xlsx
+Exec=bash -c 'cd "$(dirname "$1")" && ./update_finances.sh' _ %k
+Terminal=true
+Icon=x-office-spreadsheet

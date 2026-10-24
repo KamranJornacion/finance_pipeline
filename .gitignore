@@ -1,0 +1,14 @@
+# --- Personal data: never commit ---
+statements/
+output/
+overrides.csv
+Accounts.xlsx
+Categories.xlsx
+~$*.xlsx
+
+# --- Python / tooling ---
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
