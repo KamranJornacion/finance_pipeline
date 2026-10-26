@@ -1,4 +1,5 @@
 """Summaries and the Finances.xlsx workbook."""
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -149,6 +150,51 @@ def _category_dropdown(wb, ws, categories: list[str], col_letter: str, last_row:
 
 # ---------------------------------------------------------------- workbook
 
+def _sheet_title(name: str, used: set[str]) -> str:
+    base = re.sub(r"[\\/*?:\[\]]+", " ", str(name or "Account")).strip()
+    base = re.sub(r"\s+", " ", base)[:31] or "Account"
+    candidate = base
+    suffix = 1
+    while candidate in used:
+        suffix_text = str(suffix)
+        max_base = 31 - len(suffix_text) - 1
+        candidate = f"{base[:max_base]} {suffix_text}"
+        suffix += 1
+    used.add(candidate)
+    return candidate
+
+
+def _month_start(month: str) -> str:
+    return pd.Period(month, freq="M").to_timestamp().strftime("DATE(%Y,%m,1)")
+
+
+def _month_end(month: str) -> str:
+    return (pd.Period(month, freq="M") + 1).to_timestamp().strftime("DATE(%Y,%m,1)")
+
+
+def _ledger_month_formula(month: str, kind: str) -> str:
+    start = _month_start(month)
+    end = _month_end(month)
+    if kind == "income":
+        return (
+            f'=SUMPRODUCT((Ledger!$A$2:$A$1048576>={start})*(Ledger!$A$2:$A$1048576<{end})*'
+            f'(Ledger!$H$2:$H$1048576=FALSE)*(LEFT(Ledger!$G$2:$G$1048576,6)="Income")*(Ledger!$F$2:$F$1048576))'
+        )
+    if kind == "spending":
+        return (
+            f'=-SUMPRODUCT((Ledger!$A$2:$A$1048576>={start})*(Ledger!$A$2:$A$1048576<{end})*'
+            f'(Ledger!$H$2:$H$1048576=FALSE)*(LEFT(Ledger!$G$2:$G$1048576,6)<>"Income")*(Ledger!$F$2:$F$1048576))'
+        )
+    raise ValueError(f"Unknown month formula kind: {kind}")
+
+
+def _ledger_category_formula(category: str) -> str:
+    safe = str(category).replace('"', '""')
+    return (
+        f'=SUMPRODUCT((Ledger!$G$2:$G$1048576="{safe}")*(Ledger!$H$2:$H$1048576=FALSE)*(-Ledger!$F$2:$F$1048576))'
+    )
+
+
 def write_workbook(path: Path, df: pd.DataFrame, budget: dict[str, float], categories: list[str],
                    problems: list[str]):
     flows = cashflow_frame(df)
@@ -157,9 +203,26 @@ def write_workbook(path: Path, df: pd.DataFrame, budget: dict[str, float], categ
     review = review_items(df)
     wb = Workbook()
 
-    # ---- Summary
+    # ---- Raw data layer
+    used = set()
     ws = wb.active
     ws.title = "Summary"
+    ledger = df[["date", "account", "bank", "account_type", "description", "amount", "category",
+                 "is_transfer", "source", "source_file", "txn_id"]].copy()
+    ledger = ledger.sort_values("date", ascending=False).reset_index(drop=True)
+    ledger_ws = wb.create_sheet("Ledger")
+    _write_table(ledger_ws, ledger, formats={"date": "yyyy-mm-dd", "amount": MONEY},
+                 widths={"account": 20, "description": 45, "source_file": 26, "txn_id": 14})
+    ledger_ws.freeze_panes = "A2"
+    for acct in sorted(df["account"].drop_duplicates()):
+        acct_df = ledger[ledger["account"] == acct].copy()
+        acct_ws = wb.create_sheet(_sheet_title(acct, used))
+        _write_table(acct_ws, acct_df, formats={"date": "yyyy-mm-dd", "amount": MONEY},
+                     widths={"account": 20, "description": 45, "source_file": 26, "txn_id": 14})
+        acct_ws.freeze_panes = "A2"
+
+    # ---- Summary
+    ws = wb["Summary"]
     ws["A1"] = "Cashflow summary"
     ws["A1"].font = Font(bold=True, size=16)
     ws["A2"] = (f"Covers {df['date'].min():%b %d, %Y} to {df['date'].max():%b %d, %Y} - "
@@ -169,37 +232,64 @@ def write_workbook(path: Path, df: pd.DataFrame, budget: dict[str, float], categ
         ws["A3"] = f"{len(review)} transaction(s) need a category - see the Review tab (yellow columns)."
         ws["A3"].font = Font(bold=True, color="C00000")
     last12 = monthly.tail(12)
-    inc, sp = last12["Income"].sum(), last12["Spending"].sum()
-    kpis = [("Income", inc, MONEY0), ("Spending", sp, MONEY0), ("Net (saved)", inc - sp, MONEY0),
-            ("Savings rate", (inc - sp) / inc if inc > 0 else None, PCT)]
     ws["A5"] = f"Last {len(last12)} month(s)"
     ws["A5"].font = Font(bold=True)
-    for j, (label, val, fmt) in enumerate(kpis):
+    kpis = ["Income", "Spending", "Net (saved)", "Savings rate"]
+    for j, label in enumerate(kpis):
         ws.cell(row=6, column=1 + j, value=label).font = Font(color="595959")
-        c = ws.cell(row=7, column=1 + j, value=val)
-        c.number_format, c.font = fmt, Font(bold=True, size=14)
-    end = _write_table(ws, last12, start_row=9, formats={
-        "Income": MONEY0, "Spending": MONEY0, "Net": MONEY0, "Savings rate": PCT}, filters=False)
-    for col in "ABCD":
+
+    monthly_start_row = 2
+    ws["B7"] = f"=SUM('Monthly Cashflow'!B{monthly_start_row}:B{monthly_start_row + len(last12) - 1})"
+    ws["C7"] = f"=SUM('Monthly Cashflow'!C{monthly_start_row}:C{monthly_start_row + len(last12) - 1})"
+    ws["D7"] = "=B7-C7"
+    ws["E7"] = "=IF(B7=0,0,D7/B7)"
+    for cell in ["B7", "C7", "D7", "E7"]:
+        ws[cell].number_format = MONEY0 if cell != "E7" else PCT
+        ws[cell].font = Font(bold=True, size=14)
+
+    for idx, month in enumerate(last12["Month"], start=10):
+        month_row = idx - 8
+        ws.cell(row=idx, column=1, value=f"='Monthly Cashflow'!A{month_row}")
+        ws.cell(row=idx, column=2, value=f"='Monthly Cashflow'!B{month_row}")
+        ws.cell(row=idx, column=3, value=f"='Monthly Cashflow'!C{month_row}")
+        ws.cell(row=idx, column=4, value=f"='Monthly Cashflow'!D{month_row}")
+        ws.cell(row=idx, column=5, value=f"='Monthly Cashflow'!E{month_row}")
+
+    ws.cell(row=9, column=1, value="Month")
+    ws.cell(row=9, column=2, value="Income")
+    ws.cell(row=9, column=3, value="Spending")
+    ws.cell(row=9, column=4, value="Net")
+    ws.cell(row=9, column=5, value="Savings rate")
+    for c in range(1, 6):
+        ws.cell(row=9, column=c).fill, ws.cell(row=9, column=c).font = HEADER_FILL, HEADER_FONT
+    ws.row_dimensions[9].height = 18
+    end = max(10, len(last12) + 9)
+
+    for col in "ABCDE":
         ws.column_dimensions[col].width = 16
     ws.column_dimensions["A"].width = 18
+
+    top_rows = []
+    for i in range(1, 11):
+        top_rows.append({
+            "Top spending categories": f"='By Category'!A{i+1}",
+            "Total": f"='By Category'!B{i+1}",
+            "Per month": f"='By Category'!C{i+1}",
+        })
+    top_df = pd.DataFrame(top_rows)
     if len(last12):
         chart = BarChart()
         chart.title, chart.y_axis.title, chart.height, chart.width = "Income vs spending", "$", 8, 18
         chart.add_data(Reference(ws, min_col=2, max_col=3, min_row=9, max_row=end), titles_from_data=True)
         chart.set_categories(Reference(ws, min_col=1, min_row=10, max_row=end))
         ws.add_chart(chart, "G5")
-    top = flows[(~flows["is_income"]) & (flows["month"].astype(str).isin(last12["Month"]))]
-    top = (-top.groupby("category")["amount"].sum()).sort_values(ascending=False).head(10)
-    top_df = pd.DataFrame({"Top spending categories": top.index, "Total": top.values,
-                           "Per month": top.values / max(len(last12), 1)})
     trow = end + 3
     tend = _write_table(ws, top_df, start_row=trow, formats={"Total": MONEY0, "Per month": MONEY0}, filters=False)
     ws.column_dimensions["A"].width = 26
     if len(top_df):
         chart = BarChart()
         chart.type, chart.title, chart.height, chart.width, chart.legend = "bar", "Top categories (per month)", 8, 18, None
-        chart.add_data(Reference(ws, min_col=3, min_row=trow, max_row=tend), titles_from_data=True)
+        chart.add_data(Reference(ws, min_col=3, min_row=trow + 1, max_row=tend), titles_from_data=True)
         chart.set_categories(Reference(ws, min_col=1, min_row=trow + 1, max_row=tend))
         chart.y_axis.scaling.orientation = "minMax"
         chart.x_axis.scaling.orientation = "maxMin"
@@ -244,35 +334,81 @@ def write_workbook(path: Path, df: pd.DataFrame, budget: dict[str, float], categ
 
     # ---- Monthly cashflow
     mc = wb.create_sheet("Monthly Cashflow")
-    _write_table(mc, monthly, formats={"Income": MONEY, "Spending": MONEY, "Net": MONEY, "Savings rate": PCT},
-                 widths={c: 16 for c in monthly.columns})
+    months = []
+    for idx, row in enumerate(monthly.itertuples(index=False), start=2):
+        month = str(row[0])
+        months.append({
+            "Month": month,
+            "Income": _ledger_month_formula(month, "income"),
+            "Spending": _ledger_month_formula(month, "spending"),
+            "Net": f"=B{idx}-C{idx}",
+            "Savings rate": f"=IF(B{idx}=0,0,D{idx}/B{idx})",
+        })
+    mc_df = pd.DataFrame(months)
+    _write_table(mc, mc_df, formats={"Income": MONEY, "Spending": MONEY, "Net": MONEY, "Savings rate": PCT},
+                 widths={c: 16 for c in mc_df.columns})
     mc.freeze_panes = "B2"
+    mc["B2"].value = mc_df.iloc[0, 1]
 
     # ---- By category
     bc = wb.create_sheet("By Category")
-    _write_table(bc, cats, formats={c: MONEY0 for c in cats.columns if c != "Category"},
+    cat_rows = []
+    for idx, row in enumerate(cats.itertuples(index=False), start=2):
+        cat_rows.append({
+            "Category": row[0],
+            "Total": _ledger_category_formula(str(row[0])),
+            "Monthly avg": f"=IF(COUNTA(Ledger!$G$2:$G$1048576)=0,0,B{idx}/MAX(1,COUNTIF(Ledger!$G$2:$G$1048576,\"{str(row[0]).replace('"', '""')}\")))",
+        })
+    bc_df = pd.DataFrame(cat_rows)
+    _write_table(bc, bc_df, formats={c: MONEY0 for c in bc_df.columns if c != "Category"},
                  widths={"Category": 24})
     bc.freeze_panes = "B2"
 
     # ---- Budget
     bd = wb.create_sheet("Budget")
-    bva = budget_vs_actual(flows, budget)
-    if len(bva):
-        last = _write_table(bd, bva, formats={c: MONEY0 for c in bva.columns if c != "Category"},
-                            widths={"Category": 24, "Average vs budget": 18})
-        vcol = get_column_letter(len(bva.columns))
-        rng = f"{vcol}2:{vcol}{last}"
+    months = sorted(pd.PeriodIndex(df["date"], freq="M").unique().astype(str))
+    if months:
+        headers = ["Category", "Monthly budget"] + months + ["Average", "Average vs budget"]
+        for r, h in enumerate(headers, start=1):
+            bd.cell(row=1, column=r, value=h)
+            bd.cell(row=1, column=r).fill, bd.cell(row=1, column=r).font = HEADER_FILL, HEADER_FONT
+        for i, cat in enumerate(sorted(set(budget) | set(categories)), start=2):
+            bd.cell(row=i, column=1, value=cat)
+            if cat in budget:
+                bd.cell(row=i, column=2, value=budget[cat])
+            for j, month in enumerate(months, start=3):
+                start = pd.Period(month, freq="M").to_timestamp().strftime("DATE(%Y,%m,1)")
+                end = (pd.Period(month, freq="M") + 1).to_timestamp().strftime("DATE(%Y,%m,1)")
+                bd.cell(row=i, column=j, value=f'=SUMPRODUCT((Ledger!$A$2:$A$1048576>={start})*(Ledger!$A$2:$A$1048576<{end})*(Ledger!$H$2:$H$1048576=FALSE)*(Ledger!$G$2:$G$1048576="{cat}")*(-Ledger!$F$2:$F$1048576))')
+            avg_col = len(headers) - 1
+            bd.cell(row=i, column=avg_col, value=f'=AVERAGE(C{i}:{get_column_letter(len(headers)-2)}{i})')
+            bd.cell(row=i, column=len(headers), value=f'=IF(B{i}="",,B{i}-{get_column_letter(avg_col)}{i})')
+        vcol = get_column_letter(len(headers))
+        rng = f"{vcol}2:{vcol}{bd.max_row}"
         bd.conditional_formatting.add(rng, CellIsRule(operator="lessThan", formula=["0"], fill=RED_FILL))
         bd.conditional_formatting.add(rng, CellIsRule(operator="greaterThanOrEqual", formula=["0"], fill=GREEN_FILL))
-        bd.cell(row=last + 2, column=1, value="Average vs budget: green = under budget, red = over. "
-                                              "Change budgets in Categories.xlsx > Budget.")
+        bd.cell(row=bd.max_row + 2, column=1, value="Average vs budget: green = under budget, red = over. Change budgets in Categories.xlsx > Budget.")
         bd.freeze_panes = "B2"
 
     # ---- By account
     ba = wb.create_sheet("By Account")
-    acc = by_account(df)
-    _write_table(ba, acc, formats={"Money in": MONEY, "Money out": MONEY, "Net": MONEY},
-                 widths={"Account": 24, "Month": 10, "Money in": 14, "Money out": 14, "Net": 14})
+    accounts = sorted(df["account"].drop_duplicates())
+    months = sorted(pd.PeriodIndex(df["date"], freq="M").unique().astype(str))
+    for r, h in enumerate(["Account", "Month", "Money in", "Money out", "Net", "Transactions"], start=1):
+        ba.cell(row=1, column=r, value=h)
+        ba.cell(row=1, column=r).fill, ba.cell(row=1, column=r).font = HEADER_FILL, HEADER_FONT
+    row = 2
+    for acct in accounts:
+        for month in months:
+            ba.cell(row=row, column=1, value=acct)
+            ba.cell(row=row, column=2, value=month)
+            start = pd.Period(month, freq="M").to_timestamp().strftime("DATE(%Y,%m,1)")
+            end = (pd.Period(month, freq="M") + 1).to_timestamp().strftime("DATE(%Y,%m,1)")
+            ba.cell(row=row, column=3, value=f'=SUMPRODUCT((Ledger!$A$2:$A$1048576>={start})*(Ledger!$A$2:$A$1048576<{end})*(Ledger!$B$2:$B$1048576="{acct}")*(Ledger!$F$2:$F$1048576>0)*(Ledger!$F$2:$F$1048576))')
+            ba.cell(row=row, column=4, value=f'=SUMPRODUCT((Ledger!$A$2:$A$1048576>={start})*(Ledger!$A$2:$A$1048576<{end})*(Ledger!$B$2:$B$1048576="{acct}")*(Ledger!$F$2:$F$1048576<0)*(-Ledger!$F$2:$F$1048576))')
+            ba.cell(row=row, column=5, value=f'=C{row}-D{row}')
+            ba.cell(row=row, column=6, value=f'=COUNTIFS(Ledger!$A$2:$A$1048576,">="&{start},Ledger!$A$2:$A$1048576,"<{end}",Ledger!$B$2:$B$1048576,"{acct}")')
+            row += 1
     ba.freeze_panes = "A2"
 
     # ---- How to use

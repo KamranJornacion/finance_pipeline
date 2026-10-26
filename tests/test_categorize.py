@@ -6,12 +6,42 @@ from openpyxl import load_workbook
 from finpipe.categorize import Rule, categorize, load_overrides
 from finpipe.cli import main
 from finpipe.report import cashflow_frame, monthly_cashflow
+from finpipe.setup import load_accounts
 
 
 def _ledger(rows):
     df = pd.DataFrame(rows, columns=["txn_id", "date", "account", "description", "amount"])
     df["date"] = pd.to_datetime(df["date"])
     return df
+
+
+def test_workbook_has_ledger_and_account_data_sheets(project):
+    assert main(["--root", str(project), "--no-open"]) == 0
+    wb = load_workbook(project / "output/Finances.xlsx")
+    assert "Ledger" in wb.sheetnames
+    account_names = {acct.name for acct in load_accounts(project / "Accounts.xlsx")}
+    assert account_names.issubset(set(wb.sheetnames))
+
+
+def test_summary_uses_ledger_formulas(project):
+    assert main(["--root", str(project), "--no-open"]) == 0
+    wb = load_workbook(project / "output/Finances.xlsx")
+    summary_formula_cells = [
+        wb["Summary"]["F7"].value,
+        wb["Monthly Cashflow"]["B2"].value,
+        wb["By Category"]["B2"].value,
+    ]
+    assert all(isinstance(v, str) and "Ledger" in v for v in summary_formula_cells if v)
+
+
+def test_budget_and_account_tabs_use_ledger_formulas(project):
+    assert main(["--root", str(project), "--no-open"]) == 0
+    wb = load_workbook(project / "output/Finances.xlsx")
+    budget_formula_cells = [
+        wb["Budget"]["C2"].value,
+        wb["By Account"]["C2"].value,
+    ]
+    assert all(isinstance(v, str) and "Ledger" in v for v in budget_formula_cells if v)
 
 
 def test_rules_first_match_wins_word_start_and_direction():
@@ -86,3 +116,12 @@ def test_end_to_end_cashflow_and_review_roundtrip(project):
     assert main(["--root", str(project), "--no-open"]) == 0
     tx = pd.read_csv(project / "output/transactions.csv").set_index("description")
     assert tx.loc["SEND E-TFR ***F3k", "category"] == "Housing"
+
+
+def test_summary_top_spending_categories_are_formula_driven(project):
+    assert main(["--root", str(project), "--no-open"]) == 0
+    wb = load_workbook(project / "output/Finances.xlsx")
+    summary = wb["Summary"]
+    assert summary["A15"].value == "='By Category'!A2"
+    assert summary["B15"].value == "='By Category'!B2"
+    assert summary["C15"].value == "='By Category'!C2"
